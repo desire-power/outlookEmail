@@ -15,6 +15,28 @@ def is_external_account_api_email(value):
     )
 
 
+def authorize_external_mail_registration(upload_account_id):
+    events = queue.Queue()
+    try:
+        # Execute the existing flow in this request, including token validation and saving.
+        run_graph_oauth_task(upload_account_id, events, mode='graph')
+    except Exception:
+        return None
+    authorized = None
+    completed_successfully = False
+    while not events.empty():
+        event = events.get_nowait()
+        if event is GRAPH_OAUTH_DONE:
+            break
+        if not isinstance(event, dict):
+            continue
+        if event.get('type') == 'success' and event.get('success'):
+            authorized = event
+        elif event.get('type') == 'complete':
+            completed_successfully = bool(event.get('success'))
+    return authorized if completed_successfully else None
+
+
 @app.route('/api/external/latest-emails', methods=['GET'])
 @csrf_exempt
 @api_key_required
@@ -98,10 +120,19 @@ def api_external_register_account():
     finally:
         if db.in_transaction:
             db.rollback()
-    return jsonify({
-        'success': True,
-        'account': {
-            'id': outcome['id'], 'email': email_addr, 'group_id': group_id,
-            'account_type': 'outlook', 'is_authorized': False,
-        },
-    }), 201
+    # Release the SQLite write lock before making external OAuth requests.
+    authorization = authorize_external_mail_registration(outcome['id'])
+    upload_row = get_upload_account_for_graph_auth(outcome['id'])
+    account_payload = {
+        'id': outcome['id'], 'email': email_addr, 'group_id': group_id,
+        'account_type': 'outlook', 'is_authorized': bool(upload_row and upload_row['is_authorized']),
+    }
+    if not authorization or not account_payload['is_authorized']:
+        return jsonify({
+            'success': False,
+            'error': 'OAuth authorization failed',
+            'account': account_payload,
+        }), 502
+    account_payload['account_id'] = authorization['account_id']
+    account_payload['authorization_type'] = authorization['authorization_type']
+    return jsonify({'success': True, 'account': account_payload}), 201

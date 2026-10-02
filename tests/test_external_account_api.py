@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
@@ -25,6 +26,10 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(web, 'DATABASE', str(tmp_path / 'accounts.db'))
     monkeypatch.setitem(web.app.config, 'TESTING', True)
     monkeypatch.setitem(web.app.config, 'WTF_CSRF_ENABLED', True)
+    monkeypatch.setattr(web, 'extract_graph_refresh_token', Mock(return_value={
+        'success': True, 'client_id': 'client-id', 'refresh_token': 'initial-refresh-secret',
+    }))
+    monkeypatch.setattr(web, 'test_refresh_token', Mock(return_value=(True, None, 'refresh-secret', 'graph')))
     with web.app.app_context():
         web.init_db()
         web.set_setting('external_api_key', 'legacy-api-key')
@@ -38,10 +43,7 @@ def register(client, **overrides):
 def authorize_registered_account(client, **overrides):
     response = register(client, **overrides)
     assert response.status_code == 201
-    with web.app.app_context():
-        upload_row = web.get_upload_account_for_graph_auth(response.get_json()['account']['id'])
-        result = web.save_graph_authorization_result(upload_row, 'client-id', 'refresh-secret', 'graph')
-        return result['account_id']
+    return response.get_json()['account']['account_id']
 
 
 def request_api(client, endpoint, headers=None, query=None):
@@ -89,7 +91,7 @@ def test_register_without_session_or_csrf_encrypts_credentials(client):
     assert response.status_code == 201
     payload = response.get_json()
     assert payload['account']['email'] == 'user@outlook.com'
-    assert payload['account']['is_authorized'] is False
+    assert payload['account']['is_authorized'] is True
     assert response.headers['Cache-Control'] == 'no-store'
     assert 'secret' not in response.get_data(as_text=True)
     with web.app.app_context():
@@ -97,9 +99,13 @@ def test_register_without_session_or_csrf_encrypts_credentials(client):
         assert row['password'] != ACCOUNT['password']
         assert web.decrypt_data(row['password']) == ACCOUNT['password']
         assert row['group_id'] == 1
-        assert row['is_authorized'] == 0
+        assert row['is_authorized'] == 1
         assert row['source'] == 'external_api'
-        assert web.get_db().execute('SELECT COUNT(*) FROM accounts').fetchone()[0] == 0
+        account = web.get_db().execute('SELECT * FROM accounts').fetchone()
+        assert account['id'] == payload['account']['account_id']
+        assert web.decrypt_data(account['password']) == ACCOUNT['password']
+        assert account['refresh_token'] != 'refresh-secret'
+        assert web.decrypt_data(account['refresh_token']) == 'refresh-secret'
 
 
 def test_registration_accepts_custom_group(client):
@@ -128,21 +134,93 @@ def test_old_post_route_removed(client):
     assert client.post('/api/external/accounts', headers=HEADERS, json=ACCOUNT).status_code == 405
 
 
-def test_pending_registration_joins_existing_authorization_flow(client, monkeypatch):
+def test_registration_finishes_authorization_before_response(client, monkeypatch):
+    caller_thread = threading.get_ident()
+    run_task = web.run_graph_oauth_task
+    task_threads = []
+    def run_synchronously(*args, **kwargs):
+        task_threads.append(threading.get_ident())
+        return run_task(*args, **kwargs)
+    monkeypatch.setattr(web, 'run_graph_oauth_task', run_synchronously)
     response = register(client)
     assert response.status_code == 201
-    assert request_api(client, 'latest', HEADERS).status_code == 404
+    assert task_threads == [caller_thread]
+    assert response.get_json()['account']['authorization_type'] == 'graph'
+    web.extract_graph_refresh_token.assert_called_once()
+    assert web.extract_graph_refresh_token.call_args.args == (ACCOUNT['email'], ACCOUNT['password'])
+    assert web.extract_graph_refresh_token.call_args.kwargs['scope'] == web.GRAPH_EXTRACT_GRAPH_SCOPE
+    web.test_refresh_token.assert_called_once_with(
+        'client-id', 'initial-refresh-secret', proxy_url='', authorization_type='graph',
+    )
     with web.app.app_context():
         upload_row = web.get_upload_account_for_graph_auth(response.get_json()['account']['id'])
-        assert upload_row['is_authorized'] == 0
-        result = web.save_graph_authorization_result(upload_row, 'client-id', 'refresh-secret', 'graph')
-        account = web.get_account_by_id(result['account_id'])
+        assert upload_row['is_authorized'] == 1
+        account = web.get_account_by_id(response.get_json()['account']['account_id'])
         assert account['email'] == ACCOUNT['email']
         assert account['password'] == ACCOUNT['password']
         assert account['refresh_token'] == 'refresh-secret'
         assert web.get_upload_account_for_graph_auth(upload_row['id'])['is_authorized'] == 1
     monkeypatch.setattr(web, 'get_emails_graph', Mock(return_value={'success': True, 'emails': []}))
     assert request_api(client, 'latest', HEADERS).status_code == 200
+
+
+@pytest.mark.parametrize('phase', ['extract', 'validate', 'save'])
+def test_authorization_failure_keeps_pending_registration(client, monkeypatch, phase):
+    if phase == 'extract':
+        monkeypatch.setattr(web, 'extract_graph_refresh_token', Mock(return_value={
+            'success': False, 'error': 'password-secret', 'details': 'initial-refresh-secret',
+        }))
+    elif phase == 'validate':
+        monkeypatch.setattr(web, 'test_refresh_token', Mock(return_value=(False, 'refresh-secret', '', 'graph')))
+    else:
+        def fail_during_save(upload_row, client_id, refresh_token, **kwargs):
+            web.upsert_graph_authorized_account(upload_row['email'], ACCOUNT['password'], client_id, refresh_token)
+            raise RuntimeError('password-secret')
+        monkeypatch.setattr(web, 'save_graph_authorization_result', fail_during_save)
+    response = register(client)
+    assert response.status_code == 502
+    payload = response.get_json()
+    assert payload['success'] is False
+    assert payload['account']['is_authorized'] is False
+    assert 'account_id' not in payload['account']
+    assert 'secret' not in response.get_data(as_text=True)
+    with web.app.app_context():
+        row = web.get_upload_account_for_graph_auth(payload['account']['id'])
+        assert row['is_authorized'] == 0
+        assert web.get_upload_account_plain_password(row) == ACCOUNT['password']
+        assert web.get_account_by_email(ACCOUNT['email']) is None
+    assert register(client).status_code == 409
+
+
+def test_oauth_runs_after_releasing_registration_write_lock(client, monkeypatch):
+    def extract(*args, **kwargs):
+        db = web.get_db()
+        db.execute("INSERT INTO groups (name) VALUES ('OAuth writer')")
+        db.commit()
+        return {'success': True, 'client_id': 'client-id', 'refresh_token': 'initial-refresh-secret'}
+    monkeypatch.setattr(web, 'extract_graph_refresh_token', extract)
+    assert register(client).status_code == 201
+
+
+def test_missing_oauth_completion_is_not_success(client, monkeypatch):
+    monkeypatch.setattr(web, 'run_graph_oauth_task', Mock())
+    response = register(client)
+    assert response.status_code == 502
+    assert response.get_json()['account']['is_authorized'] is False
+
+
+def test_worker_exception_returns_failure(client, monkeypatch):
+    monkeypatch.setattr(web, 'run_graph_oauth_task', Mock(side_effect=RuntimeError('password-secret')))
+    response = register(client)
+    assert response.status_code == 502
+    assert 'password-secret' not in response.get_data(as_text=True)
+
+
+def test_actual_validation_channel_is_returned(client, monkeypatch):
+    monkeypatch.setattr(web, 'test_refresh_token', Mock(return_value=(True, None, 'refresh-secret', 'imap')))
+    response = register(client)
+    assert response.status_code == 201
+    assert response.get_json()['account']['authorization_type'] == 'imap'
 
 
 @pytest.mark.parametrize('data', [
@@ -171,7 +249,7 @@ def test_case_insensitive_duplicate_preserves_credentials(client):
     with web.app.app_context():
         row = web.get_db().execute('SELECT * FROM outlook_upload_accounts').fetchone()
         assert web.decrypt_data(row['password']) == ACCOUNT['password']
-        assert row['is_authorized'] == 0
+        assert row['is_authorized'] == 1
         assert web.get_db().execute('SELECT COUNT(*) FROM outlook_upload_accounts').fetchone()[0] == 1
 
 

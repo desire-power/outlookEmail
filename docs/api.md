@@ -39,7 +39,7 @@
 | 方法 | 路径 | 鉴权 | 返回类型 | 说明 |
 | --- | --- | --- | --- | --- |
 | GET | `/api/external/accounts` | API Key | JSON | 获取普通邮箱账号列表 |
-| POST | `/api/external/mail` | API Key | JSON | 使用 email/password 注册 Outlook 账号（默认未授权） |
+| POST | `/api/external/mail` | API Key | JSON | 使用 email/password 注册并同步执行 Outlook OAuth 授权，返回成败 |
 | GET | `/api/external/latest-emails` | API Key | JSON | 实时获取指定邮箱的最新邮件（默认1封） |
 | GET | `/api/external/emails` | API Key | JSON | 获取指定邮箱邮件列表 |
 | POST | `/api/external/outlook/upload` | API Key | JSON | 上传 Outlook 邮箱账号密码到上传表（默认未授权，支持单条/批量） |
