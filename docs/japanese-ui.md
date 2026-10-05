@@ -2,6 +2,24 @@
 
 このforkではWebのログイン画面・メール管理画面・共有画面を標準で日本語表示します。
 
+## Docker Composeで起動する
+
+このブランチのルートで、通常のコマンドを実行してください。
+
+```sh
+docker compose up -d
+```
+
+`docker-compose.override.yml` が自動で読み込まれ、手元のソースを `outlookemail:ja-local` としてビルドし、日本語表示で起動します。`pull_policy: build` により、次回の `up` でも最新のソースからビルドします。ポート・データ保存先・ログイン設定は既存の `docker-compose.yml` を引き継ぎます。
+
+このローカルビルドでは、画面からのDockerオンライン更新を無効にします。更新する場合はソースを取得して、再び `docker compose up -d` を実行してください。
+
+`-f` でComposeファイルを指定する場合は、overrideも明示してください。
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+```
+
 ## 構成
 
 - `static/locales/ja.json`: 中国語の表示文言と日本語訳。
@@ -17,7 +35,7 @@ JavaScriptのURLは上流のままです。翻訳辞書だけが変わった場�
 
 起動するプロセスの環境変数に `OUTLOOK_UI_LANGUAGE=zh-CN` を設定して再起動すると、元のテンプレート・JavaScriptを配信します。省略時は `ja` です。画面内での言語切り替えはありません。
 
-Dockerの場合は自分のCompose設定・override等で環境変数をコンテナに渡してください。この変更にはCompose設定の変更を含めていません。
+標準のCompose起動ではoverrideが `ja` を明示しています。Dockerで中国語表示に戻す場合は、override内の `OUTLOOK_UI_LANGUAGE` を `zh-CN` に変更してコンテナを再作成してください。
 
 ## fork元のmainを取り込むとき
 
