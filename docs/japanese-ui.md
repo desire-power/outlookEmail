@@ -10,7 +10,9 @@
 docker compose up -d
 ```
 
-`docker-compose.override.yml` が自動で読み込まれ、手元のソースを `outlookemail:ja-local` としてビルドし、日本語表示で起動します。`pull_policy: build` により、次回の `up` でも最新のソースからビルドします。ポート・データ保存先・ログイン設定は既存の `docker-compose.yml` を引き継ぎます。
+`docker-compose.override.yml` が自動で読み込まれ、手元のソースを `outlookemail:ja-local` としてビルドし、日本語表示で起動します。`pull_policy: build` により、次回の `up` でも最新のソースからビルドします。公開ポートはoverride側で `5001:5000` に設定しているため、ブラウザから `http://localhost:5001` にアクセスしてください。データ保存先・ログイン設定は既存の `docker-compose.yml` を引き継ぎます。
+
+ポートは `!override` で一覧ごと置き換え、元のホストポート5000を同時に公開しません。この指定は[Docker Compose 2.24.4以降](https://docs.docker.com/reference/compose-file/merge/#replace-value)が必要です。
 
 このローカルビルドでは、画面からのDockerオンライン更新を無効にします。更新する場合はソースを取得して、再び `docker compose up -d` を実行してください。
 
