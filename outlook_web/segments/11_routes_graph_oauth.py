@@ -530,7 +530,8 @@ def save_graph_authorization_result(upload_row: Any, client_id: str,
 
 
 def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, Any] | object]",
-                         mode: str = "graph") -> None:
+                         mode: str = "graph", *,
+                         save_authorization: Optional[Callable[..., Dict[str, Any]]] = None) -> None:
     def emit(payload: Dict[str, Any]) -> None:
         output_queue.put(payload)
 
@@ -613,7 +614,7 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
                 return
 
             token_to_save = rotated_refresh_token or refresh_token
-            save_result = save_graph_authorization_result(
+            save_result = (save_authorization or save_graph_authorization_result)(
                 upload_row,
                 client_id,
                 token_to_save,

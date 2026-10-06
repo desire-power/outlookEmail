@@ -173,10 +173,11 @@ def test_authorization_failure_keeps_pending_registration(client, monkeypatch, p
     elif phase == 'validate':
         monkeypatch.setattr(web, 'test_refresh_token', Mock(return_value=(False, 'refresh-secret', '', 'graph')))
     else:
-        def fail_during_save(upload_row, client_id, refresh_token, **kwargs):
-            web.upsert_graph_authorized_account(upload_row['email'], ACCOUNT['password'], client_id, refresh_token)
+        mark_authorized = web.mark_upload_account_authorized
+        def fail_during_save(account_id):
+            mark_authorized(account_id)
             raise RuntimeError('password-secret')
-        monkeypatch.setattr(web, 'save_graph_authorization_result', fail_during_save)
+        monkeypatch.setattr(web, 'mark_upload_account_authorized', fail_during_save)
     response = register(client)
     assert response.status_code == 502
     payload = response.get_json()
@@ -352,3 +353,54 @@ def test_legacy_auth_and_management_protection_unchanged(client):
     assert getattr(web.app.view_functions['api_external_get_emails'], '_requires_api_key', False)
     assert getattr(web.app.view_functions['api_external_register_account'], '_requires_api_key', False)
     assert getattr(web.app.view_functions['api_external_latest_emails'], '_requires_api_key', False)
+
+
+@pytest.mark.parametrize('phase', ['extract', 'validate'])
+@pytest.mark.parametrize('collision', ['primary', 'alias'])
+def test_registration_conflict_during_oauth_preserves_web_import(client, monkeypatch, phase, collision):
+    oauth_waiting = threading.Event()
+    resume_oauth = threading.Event()
+    original_phase = getattr(web, 'extract_graph_refresh_token' if phase == 'extract' else 'test_refresh_token')
+
+    def pause_oauth(*args, **kwargs):
+        oauth_waiting.set()
+        assert resume_oauth.wait(10), 'OAuth regression test did not resume'
+        return original_phase(*args, **kwargs)
+
+    monkeypatch.setattr(web, 'extract_graph_refresh_token' if phase == 'extract' else 'test_refresh_token', pause_oauth)
+    ui_client = web.app.test_client()
+    with ui_client.session_transaction() as session:
+        session['logged_in'] = True
+        session['login_session_version'] = web.DEFAULT_LOGIN_SESSION_VERSION
+    csrf_token = ui_client.get('/api/csrf-token').get_json()['csrf_token']
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(register, web.app.test_client())
+        try:
+            assert oauth_waiting.wait(10), 'API did not reach the OAuth phase'
+            imported_email = 'USER@OUTLOOK.COM' if collision == 'primary' else 'owner@outlook.com'
+            imported = ui_client.post('/api/accounts', headers={'X-CSRFToken': csrf_token}, json={
+                'account_string': f'{imported_email}----web-password----web-client----web-refresh',
+                'group_id': 1, 'remark': 'Web import', 'status': 'inactive', 'proxy_url': 'direct',
+            })
+            assert imported.status_code == 200
+            assert imported.get_json()['added_count'] == 1
+            with web.app.app_context():
+                db = web.get_db()
+                before = dict(db.execute('SELECT * FROM accounts').fetchone())
+                if collision == 'alias':
+                    db.execute('INSERT INTO account_aliases (account_id, alias_email) VALUES (?, ?)',
+                               (before['id'], 'USER@OUTLOOK.COM'))
+                    db.commit()
+        finally:
+            resume_oauth.set()
+        response = future.result(timeout=10)
+
+    assert response.status_code == 409
+    assert response.get_json() == {'success': False, 'error': 'Email account already exists'}
+    assert response.headers['Cache-Control'] == 'no-store'
+    with web.app.app_context():
+        db = web.get_db()
+        assert dict(db.execute('SELECT * FROM accounts').fetchone()) == before
+        assert db.execute('SELECT COUNT(*) FROM accounts').fetchone()[0] == 1
+        assert db.execute('SELECT is_authorized FROM outlook_upload_accounts').fetchone()[0] == 0

@@ -15,13 +15,72 @@ def is_external_account_api_email(value):
     )
 
 
+class ExternalMailRegistrationConflict(Exception):
+    """An address was registered by another request while OAuth was running."""
+
+
+def save_external_mail_authorization(upload_row, client_id, refresh_token, authorization_type=None):
+    """Insert a new account only; check ownership and save under one write lock."""
+    db = get_db()
+    email_addr = normalize_email_address(upload_row['email'])
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        if email_exists_as_primary(email_addr) or email_exists_as_alias(email_addr):
+            raise ExternalMailRegistrationConflict('Email account already exists')
+        cursor = db.execute(ACCOUNT_INSERT_SQL, build_account_insert_values(
+            email_addr,
+            get_upload_account_plain_password(upload_row),
+            client_id,
+            refresh_token,
+            group_id=resolve_upload_group_id(upload_row['group_id']),
+            remark=upload_row['remark'] or '',
+            proxy_url=upload_row['proxy_url'] or '',
+            imap_host=IMAP_SERVER_NEW,
+            imap_port=IMAP_PORT,
+        ))
+        if cursor.rowcount != 1:
+            raise ExternalMailRegistrationConflict('Email account already exists')
+        account_id = int(cursor.lastrowid)
+        apply_account_tag_ids(account_id, decode_upload_tag_ids(upload_row['tag_ids']), db)
+        db.execute(
+            '''
+            UPDATE accounts
+            SET authorization_type = ?, refresh_token_updated_at = CURRENT_TIMESTAMP,
+                last_refresh_status = 'never', last_refresh_error = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            ''',
+            (normalize_outlook_authorization_type(authorization_type, strict=True), account_id),
+        )
+        mark_upload_account_authorized(int(upload_row['id']))
+        db.commit()
+        return {'account_id': account_id, 'created': True}
+    except Exception:
+        db.rollback()
+        raise
+
+
 def authorize_external_mail_registration(upload_account_id):
     events = queue.Queue()
+    conflict = False
+
+    def save_new_account(*args, **kwargs):
+        nonlocal conflict
+        try:
+            return save_external_mail_authorization(*args, **kwargs)
+        except ExternalMailRegistrationConflict:
+            conflict = True
+            raise
+
     try:
-        # Execute the existing flow in this request, including token validation and saving.
-        run_graph_oauth_task(upload_account_id, events, mode='graph')
+        # Reuse extraction and validation, but never upsert an existing formal account.
+        run_graph_oauth_task(upload_account_id, events, mode='graph', save_authorization=save_new_account)
     except Exception:
+        if conflict:
+            raise ExternalMailRegistrationConflict('Email account already exists')
         return None
+    if conflict:
+        raise ExternalMailRegistrationConflict('Email account already exists')
     authorized = None
     completed_successfully = False
     while not events.empty():
@@ -121,7 +180,10 @@ def api_external_register_account():
         if db.in_transaction:
             db.rollback()
     # Release the SQLite write lock before making external OAuth requests.
-    authorization = authorize_external_mail_registration(outcome['id'])
+    try:
+        authorization = authorize_external_mail_registration(outcome['id'])
+    except ExternalMailRegistrationConflict:
+        return jsonify({'success': False, 'error': 'Email account already exists'}), 409
     upload_row = get_upload_account_for_graph_auth(outcome['id'])
     account_payload = {
         'id': outcome['id'], 'email': email_addr, 'group_id': group_id,
