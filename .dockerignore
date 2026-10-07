@@ -43,3 +43,17 @@ docker-compose.yml
 # 文档
 README.md
 *.md
+
+# Runtime credentials and persisted application data never belong in an image.
+.env
+.env.*
+*.env
+secret_key.txt
+.venv/
+data/
+.ssh/
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+outlookemail_lightsail*

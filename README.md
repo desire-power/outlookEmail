@@ -51,6 +51,8 @@ Windows 桌面版发现新版本后，可在页面顶部的版本入口点击「
   `sudo xattr -rd com.apple.quarantine /Applications/OutlookEmail.app` 
 - 默认登录密码仍然是 `admin123`，首次登录后建议立即修改
 
+[AWS Lightsailへの公開・更新手順（日本語）](docs/AWS_DEPLOY.md)
+
 ### 方式三：使用 Docker（推荐服务器部署）
 
 ```bash

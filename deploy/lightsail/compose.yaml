@@ -1,0 +1,45 @@
+name: outlookemail
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      OUTLOOK_EMAIL_DOMAIN: ${OUTLOOK_EMAIL_DOMAIN:?domain is required}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./caddy:/etc/caddy:ro
+      - ./www:/srv:ro
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+  app:
+    image: ${OUTLOOK_EMAIL_IMAGE:?image digest is required}
+    restart: unless-stopped
+    env_file:
+      - ./app.env
+    environment:
+      FLASK_ENV: production
+      OUTLOOK_UI_LANGUAGE: ja
+      DOCKER_UPDATE_ENABLED: "false"
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:5000/login"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
