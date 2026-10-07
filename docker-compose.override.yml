@@ -1,0 +1,16 @@
+# Automatically loaded alongside docker-compose.yml by `docker compose up`.
+# Keep fork-specific settings here to reduce conflicts with upstream main.
+services:
+  outlook-mail-reader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: outlookemail:ja-local
+    pull_policy: build
+    # Replace the base port list instead of also exposing its port 5000.
+    ports: !override
+      - "5001:5000"
+    environment:
+      OUTLOOK_UI_LANGUAGE: ja
+      # Local builds are updated by Compose, rather than pulling upstream images.
+      DOCKER_UPDATE_ENABLED: "false"
