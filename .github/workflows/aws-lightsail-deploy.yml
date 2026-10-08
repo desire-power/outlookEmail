@@ -1,0 +1,198 @@
+name: Deploy OutlookEmail to AWS
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/aws-lightsail-deploy.yml
+      - deploy/lightsail/**
+      - scripts/aws/**
+      - tests/test_aws_deploy.py
+      - Dockerfile
+      - .dockerignore
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "通常は空欄（mainの現在のコード）。切り戻す場合はmainに含まれる40桁SHA"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: outlookemail-aws-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'production' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-1
+  AWS_ACCOUNT_ID: "084828573765"
+  ECR_REPOSITORY_NAME: prd-outlookemail
+  ECR_REPOSITORY_URL: 084828573765.dkr.ecr.ap-northeast-1.amazonaws.com/prd-outlookemail
+  LIGHTSAIL_INSTANCE_NAME: prd-outlookemail
+  LIGHTSAIL_HOST: 52.199.82.242
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Validate deployment scripts
+        run: python3 -B -m unittest discover -s tests -p test_aws_deploy.py -v
+      - name: Validate secret configuration for manual deployment
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
+          LIGHTSAIL_SSH_PRIVATE_KEY: ${{ secrets.LIGHTSAIL_SSH_PRIVATE_KEY }}
+          LIGHTSAIL_SSH_KNOWN_HOSTS: ${{ secrets.LIGHTSAIL_SSH_KNOWN_HOSTS }}
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo '::error::Run this workflow from main'
+            exit 1
+          fi
+          python3 scripts/aws/deploy_via_ssh.py --check-secrets
+
+  build:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Select a commit from main
+        id: source
+        env:
+          REQUESTED_SHA: ${{ inputs.commit_sha }}
+        run: |
+          sha="${REQUESTED_SHA:-$GITHUB_SHA}"
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Expected a full commit SHA'
+            exit 1
+          fi
+          git merge-base --is-ancestor "$sha" origin/main
+          echo "commit=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.source.outputs.commit }}
+          path: image-source
+      - name: Authenticate to AWS for ECR push
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::084828573765:role/prd-outlookemail-github-push
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+      - name: Reuse the immutable image when it already exists
+        id: existing
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          digest=$(aws ecr batch-get-image --repository-name "$ECR_REPOSITORY_NAME" --image-ids "imageTag=sha-$SOURCE_COMMIT" --query 'images[0].imageId.imageDigest' --output text)
+          if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          elif [ "$digest" != None ]; then
+            echo '::error::Unexpected ECR image lookup response'
+            exit 1
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.existing.outputs.digest == ''
+      - name: Log in to the private registry
+        if: steps.existing.outputs.digest == ''
+        run: |
+          registry="${ECR_REPOSITORY_URL%%/*}"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$registry"
+      - name: Build the application image locally
+        if: steps.existing.outputs.digest == ''
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: image-source
+          file: image-source/Dockerfile
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: ${{ env.ECR_REPOSITORY_URL }}:sha-${{ steps.source.outputs.commit }}
+          cache-from: type=gha,scope=outlookemail-aws-amd64
+          cache-to: type=gha,mode=max,scope=outlookemail-aws-amd64
+          provenance: false
+          sbom: false
+      - name: Check the image before pushing
+        if: steps.existing.outputs.digest == ''
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          image="$ECR_REPOSITORY_URL:sha-$SOURCE_COMMIT"
+          cid=$(docker run -d --network none -e SECRET_KEY=ci-only-image-smoke-secret-key -e LOGIN_PASSWORD=ci-only-strong-password -e OUTLOOK_UI_LANGUAGE=ja "$image")
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          ready=false
+          for attempt in $(seq 1 60); do
+            if docker exec "$cid" curl --fail --silent http://127.0.0.1:5000/login >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" != true ]; then
+            echo '::error::The built image did not become ready'
+            exit 1
+          fi
+          docker exec "$cid" sh -c 'test ! -e /app/.env.local && test ! -e /app/.env'
+      - name: Push the verified image
+        if: steps.existing.outputs.digest == ''
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: docker push "$ECR_REPOSITORY_URL:sha-$SOURCE_COMMIT"
+      - name: Resolve the immutable deployment digest
+        id: image
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          digest=$(aws ecr batch-get-image --repository-name "$ECR_REPOSITORY_NAME" --image-ids "imageTag=sha-$SOURCE_COMMIT" --query 'images[0].imageId.imageDigest' --output text)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "image=$ECR_REPOSITORY_URL@$digest" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Authenticate to AWS for deployment
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::084828573765:role/prd-outlookemail-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+      - name: Allow this runner to connect by SSH
+        run: |
+          ip=$(curl -4 -fsS https://checkip.amazonaws.com)
+          echo "RUNNER_PUBLIC_CIDR=$ip/32" >> "$GITHUB_ENV"
+          python3 scripts/aws/firewall.py open "$LIGHTSAIL_INSTANCE_NAME" "$ip/32"
+      - name: Deploy and check readiness
+        env:
+          LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
+          LIGHTSAIL_SSH_PRIVATE_KEY: ${{ secrets.LIGHTSAIL_SSH_PRIVATE_KEY }}
+          LIGHTSAIL_SSH_KNOWN_HOSTS: ${{ secrets.LIGHTSAIL_SSH_KNOWN_HOSTS }}
+          LIGHTSAIL_SSH_KEY_PASSPHRASE: ${{ secrets.LIGHTSAIL_SSH_KEY_PASSPHRASE }}
+          DEPLOY_IMAGE: ${{ needs.build.outputs.image }}
+          DEPLOY_COMMIT: ${{ needs.build.outputs.commit }}
+        run: python3 scripts/aws/deploy_via_ssh.py --host "$LIGHTSAIL_HOST" --image "$DEPLOY_IMAGE" --commit "$DEPLOY_COMMIT"
+      - name: Remove only the SSH rule added by this job
+        if: always() && env.RUNNER_SSH_RULE_ADDED == 'true'
+        run: python3 scripts/aws/firewall.py close "$LIGHTSAIL_INSTANCE_NAME" "$RUNNER_PUBLIC_CIDR"

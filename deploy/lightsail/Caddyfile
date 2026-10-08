@@ -1,0 +1,11 @@
+{$OUTLOOK_EMAIL_DOMAIN} {
+    reverse_proxy app:5000
+}
+
+:8080 {
+    handle /healthz {
+        rewrite * /login
+        reverse_proxy app:5000
+    }
+    respond 404
+}
