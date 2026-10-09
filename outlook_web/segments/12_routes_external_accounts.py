@@ -191,13 +191,14 @@ def complete_external_mail_registration(email_addr, password, group_id, data, ht
             return jsonify({'success': False, 'error': 'Email account already exists'}), 409
         remark = sanitize_input(data.get('remark', '').strip(), max_length=500)
         if existing_upload:
-            if existing_upload['source'] != 'external_api' or existing_upload['is_authorized'] != 0:
+            if existing_upload['source'] != 'external_api':
                 return jsonify({'success': False, 'error': 'Email account already exists'}), 409
-            # Retry a pending external registration using this request's settings.
+            # Reuse external registrations, including records left after account deletion.
             db.execute(
                 '''
                 UPDATE outlook_upload_accounts
                 SET password = ?, group_id = ?, remark = ?, proxy_url = ?,
+                    is_authorized = 0,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 ''',
