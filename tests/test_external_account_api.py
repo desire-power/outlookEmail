@@ -375,7 +375,7 @@ def test_registration_in_progress_rejects_duplicate_without_changing_pending(cli
         assert future.result(timeout=10).status_code == 201
 
 
-@pytest.mark.parametrize('source,authorized', [('auto_auth', 0), ('external_api', 1)])
+@pytest.mark.parametrize('source,authorized', [('auto_auth', 0), ('auto_auth', 1)])
 def test_other_pending_registrations_are_not_overwritten(client, source, authorized):
     with web.app.app_context():
         db = web.get_db()
@@ -386,6 +386,59 @@ def test_other_pending_registrations_are_not_overwritten(client, source, authori
     assert register(client).status_code == 409
     with web.app.app_context():
         assert dict(web.get_db().execute('SELECT * FROM outlook_upload_accounts').fetchone()) == before
+
+
+@pytest.mark.parametrize('delete_method', ['id', 'email', 'batch'])
+@pytest.mark.parametrize('phase', ['success', 'extract', 'validate', 'save'])
+def test_deleted_account_can_be_registered_again(client, monkeypatch, delete_method, phase):
+    original = register(client).get_json()['account']
+    with client.session_transaction() as session:
+        session['logged_in'] = True
+        session['login_session_version'] = web.DEFAULT_LOGIN_SESSION_VERSION
+    csrf_token = client.get('/api/csrf-token').get_json()['csrf_token']
+    headers = {'X-CSRFToken': csrf_token}
+    if delete_method == 'batch':
+        deleted = client.post('/api/accounts/batch-delete', headers=headers,
+                              json={'account_ids': [original['account_id']]})
+    else:
+        path = (f"/api/accounts/{original['account_id']}" if delete_method == 'id'
+                else f"/api/accounts/email/{ACCOUNT['email']}")
+        deleted = client.delete(path, headers=headers)
+    assert deleted.get_json()['success'] is True
+    with web.app.app_context():
+        assert web.get_account_by_email(ACCOUNT['email']) is None
+        assert web.get_upload_account_for_graph_auth(original['id'])['is_authorized'] == 1
+
+    with monkeypatch.context() as failure:
+        if phase == 'extract':
+            failure.setattr(web, 'extract_graph_refresh_token', Mock(return_value={'success': False}))
+        elif phase == 'validate':
+            failure.setattr(web, 'test_refresh_token', Mock(return_value=(False, 'invalid_grant', '', 'graph')))
+        elif phase == 'save':
+            failure.setattr(web, 'mark_upload_account_authorized', Mock(side_effect=RuntimeError('Save failed')))
+        response = register(client, email='USER@OUTLOOK.COM', password='replacement',
+                            remark='Added again', httpProxy=HTTP_PROXY)
+    assert response.status_code == (201 if phase == 'success' else 502)
+    payload = response.get_json()['account']
+    assert payload['id'] == original['id']
+    assert payload['is_authorized'] is (phase == 'success')
+    with web.app.app_context():
+        db = web.get_db()
+        row = db.execute('SELECT * FROM outlook_upload_accounts').fetchone()
+        assert db.execute('SELECT COUNT(*) FROM outlook_upload_accounts').fetchone()[0] == 1
+        assert row['password'] != 'replacement'
+        assert web.get_upload_account_plain_password(row) == 'replacement'
+        assert row['remark'] == 'Added again'
+        assert row['proxy_url'] == HTTP_PROXY
+        if phase != 'success':
+            assert web.get_account_by_email(ACCOUNT['email']) is None
+    if phase != 'success':
+        response = register(client, password='replacement')
+        assert response.status_code == 201
+        assert response.get_json()['account']['id'] == original['id']
+    with web.app.app_context():
+        assert web.get_account_by_email(ACCOUNT['email'])['password'] == 'replacement'
+        assert web.get_upload_account_for_graph_auth(original['id'])['is_authorized'] == 1
 
 
 @pytest.mark.parametrize('retry', [False, True])
