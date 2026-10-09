@@ -1,6 +1,7 @@
 """Additive account APIs using the existing external API Key authentication."""
 
 from outlook_web.external_http_proxy import normalize_external_http_proxy
+from outlook_web.graph_oauth_diagnostics import append_graph_oauth_event_log
 
 
 @app.after_request
@@ -62,9 +63,10 @@ def save_external_mail_authorization(upload_row, client_id, refresh_token, autho
         raise
 
 
-def authorize_external_mail_registration(upload_account_id):
+def authorize_external_mail_registration(upload_account_id, error_log=None):
     events = queue.Queue()
     conflict = False
+    task_exception = None
 
     def save_new_account(*args, **kwargs):
         nonlocal conflict
@@ -77,10 +79,10 @@ def authorize_external_mail_registration(upload_account_id):
     try:
         # Reuse extraction and validation, but never upsert an existing formal account.
         run_graph_oauth_task(upload_account_id, events, mode='graph', save_authorization=save_new_account)
-    except Exception:
+    except Exception as exc:
         if conflict:
             raise ExternalMailRegistrationConflict('Email account already exists')
-        return None
+        task_exception = exc
     if conflict:
         raise ExternalMailRegistrationConflict('Email account already exists')
     authorized = None
@@ -91,10 +93,18 @@ def authorize_external_mail_registration(upload_account_id):
             break
         if not isinstance(event, dict):
             continue
+        if error_log is not None:
+            append_graph_oauth_event_log(error_log, event)
         if event.get('type') == 'success' and event.get('success'):
             authorized = event
         elif event.get('type') == 'complete':
             completed_successfully = bool(event.get('success'))
+    if task_exception is not None:
+        if error_log is not None:
+            append_graph_oauth_event_log(error_log, {
+                'type': 'error', 'message': '授权任务异常', 'details': str(task_exception),
+            })
+        return None
     return authorized if completed_successfully else None
 
 
@@ -194,8 +204,9 @@ def api_external_register_account():
         if db.in_transaction:
             db.rollback()
     # Release the SQLite write lock before making external OAuth requests.
+    error_log = []
     try:
-        authorization = authorize_external_mail_registration(outcome['id'])
+        authorization = authorize_external_mail_registration(outcome['id'], error_log)
     except ExternalMailRegistrationConflict:
         return jsonify({'success': False, 'error': 'Email account already exists'}), 409
     upload_row = get_upload_account_for_graph_auth(outcome['id'])
@@ -207,6 +218,7 @@ def api_external_register_account():
         return jsonify({
             'success': False,
             'error': 'OAuth authorization failed',
+            'rawErrorLog': graph_oauth_safe_details('\n'.join(error_log), secrets=[password]),
             'account': account_payload,
         }), 502
     account_payload['account_id'] = authorization['account_id']

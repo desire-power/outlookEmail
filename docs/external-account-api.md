@@ -99,12 +99,15 @@ curl 'http://localhost:5000/api/external/mail' \
 
 OAuth待機中にWeb画面などから同じアドレスや別名が登録された場合も、保存直前に再確認して `409` を返します。最終確認・正式アカウントの新規挿入・認可済み状態の更新は同じ書き込みトランザクションで行います。先に登録されたアカウントの認証情報や設定は変更せず、API側の登録待ちレコードは未認可のまま保持します。
 
-OAuth認可・Token検証・正式保存が失敗した場合は `502` で以下を返します。登録待ちのレコードは保持するため、既存のWeb画面から認可を再実行できます。同じアドレスの再登録は `409` になります。外部サービスの詳細エラー・認可ログはレスポンスに含めません。
+OAuth認可・Token検証・正式保存が失敗した場合は `502` で以下を返します。登録待ちのレコードは保持するため、既存のWeb画面から認可を再実行できます。同じアドレスの再登録は `409` になります。
+
+`error` は従来どおり `OAuth authorization failed` を返し、`rawErrorLog` に今回のバックエンド認可ログと詳細エラーを発生順に改行で連結した文字列を追加します。認可開始・モード・Scope・Microsoftログイン・Token検証・保存時の失敗まで、生成されたログを翻訳・要約・文字数制限せずに返します。パスワード・トークン・プロキシ認証情報は `***` にマスクします。MicrosoftのレスポンスHTML全体やWeb画面だけで付ける時刻・所要時間は含みません。成功レスポンスや入力不正・重複エラーには `rawErrorLog` を追加しません。
 
 ```json
 {
   "success": false,
   "error": "OAuth authorization failed",
+  "rawErrorLog": "开始 GraphAPI OAuth 授权\n授权模式: GraphAPI\n授权 Scope: offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/User.Read\n获取 Microsoft 授权页面: user@outlook.com\n提交 Microsoft 登录凭据\nMicrosoft 登录失败\nJavaScript错误信息: Your account or password is incorrect. If you don't remember your password, reset it.",
   "account": {
     "id": 1,
     "email": "user@outlook.com",

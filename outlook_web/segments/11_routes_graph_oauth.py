@@ -10,6 +10,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from flask import stream_with_context
+from outlook_web.graph_oauth_diagnostics import extract_graph_login_error, mask_graph_oauth_secrets
 
 if TYPE_CHECKING:
     from web_outlook_app import *  # noqa: F403
@@ -57,8 +58,8 @@ def graph_oauth_sse(payload: Dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def graph_oauth_safe_details(details: Any) -> str:
-    return sanitize_error_details(str(details or ""))[:500]
+def graph_oauth_safe_details(details: Any, *, secrets=()) -> str:
+    return sanitize_error_details(mask_graph_oauth_secrets(str(details or ""), secrets))
 
 
 def graph_oauth_log(log: Optional[Callable[[str], None]], message: str) -> None:
@@ -133,6 +134,13 @@ def extract_graph_refresh_token(
     proxy_url: str = None,
 ) -> Dict[str, Any]:
     """使用纯 HTTP OAuth2 授权码流程提取 Outlook refresh_token。"""
+    def failure(error: str, details: str = "") -> Dict[str, Any]:
+        return make_graph_oauth_response(
+            False,
+            graph_oauth_safe_details(error, secrets=(password,)),
+            graph_oauth_safe_details(details, secrets=(password,)),
+        )
+
     try:
         session = session_factory() if session_factory else requests.Session()
         resolved_proxy = str(proxy_url or '').strip()
@@ -172,7 +180,7 @@ def extract_graph_refresh_token(
             if ppft:
                 flow_token = ppft.group(1)
         if not flow_token:
-            return make_graph_oauth_response(False, "无法提取 Flow Token", "未在授权页面找到 PPFT 字段")
+            return failure("无法提取 Flow Token", "未在授权页面找到 PPFT 字段")
 
         post_url = ""
         urlpost_match = re.search(r'"urlPost"\s*:\s*"([^"]+)"', text)
@@ -212,9 +220,14 @@ def extract_graph_refresh_token(
         post_url_check = getattr(resp2, "url", "") or post_url
 
         if resp2.status_code == 200 and "ppsecure/post.srf" in post_url_check:
+            javascript_error = extract_graph_login_error(post_html)
+            if javascript_error:
+                return failure(
+                    "Microsoft 登录失败",
+                    f"JavaScript错误信息: {re.sub(r'<[^>]+>', '', javascript_error).strip()}",
+                )
             # 情况1：检查JavaScript错误变量和HTML错误元素
             error_markers = [
-                (r'sErrTxt["\s:=]+["\']([^"\']+)', "JavaScript错误信息"),
                 (r'<div[^>]*id=["\']error["\'][^>]*>([^<]+)', "错误提示框"),
                 (r'data-bind=["\']text:\s*unsafe_(\w+)["\']', "验证失败"),
                 (r'<div[^>]*class=["\'][^"\']*error[^"\']*["\'][^>]*>([^<]+)', "错误样式"),
@@ -226,10 +239,9 @@ def extract_graph_refresh_token(
                     error_detail = match.group(1).strip() if match.lastindex and len(match.groups()) > 0 else error_type
                     # 清理HTML标签
                     error_detail = re.sub(r'<[^>]+>', '', error_detail).strip()
-                    return make_graph_oauth_response(
-                        False,
+                    return failure(
                         "Microsoft 登录失败",
-                        f"{error_type}: {graph_oauth_safe_details(error_detail)}"
+                        f"{error_type}: {error_detail}"
                     )
 
             # 情况2：没有重定向且停留在post.srf，检查是否返回了登录表单
@@ -250,8 +262,7 @@ def extract_graph_refresh_token(
                             error_hint = hint
                             break
 
-                    return make_graph_oauth_response(
-                        False,
+                    return failure(
                         "登录凭据验证失败",
                         f"提交凭据后返回了登录表单，通常表示{error_hint}。请手动登录 https://outlook.live.com 确认账号状态。"
                     )
@@ -294,12 +305,12 @@ def extract_graph_refresh_token(
             if "localhost" in current_url and "error" in current_url:
                 params = urllib.parse.parse_qs(urllib.parse.urlparse(current_url).query)
                 err = params.get("error_description", params.get("error", ["?"]))[0]
-                return make_graph_oauth_response(False, "OAuth 错误", err)
+                return failure("OAuth 错误", err)
 
             if "Consent/Update" in current_url or "Consent/update" in current_url:
                 server_data = re.search(r'ServerData\s*=\s*(\{.*?\});', text, re.DOTALL)
                 if not server_data:
-                    return make_graph_oauth_response(False, "同意页面处理失败", "无法解析 ServerData")
+                    return failure("同意页面处理失败", "无法解析 ServerData")
                 graph_oauth_log(log, "接受 Outlook 授权同意页面")
                 sd = json.loads(server_data.group(1))
                 resp2 = session.post(
@@ -323,7 +334,7 @@ def extract_graph_refresh_token(
                     re.DOTALL | re.IGNORECASE,
                 )
                 if not form_match:
-                    return make_graph_oauth_response(False, "安全信息页面处理失败", "无法找到表单")
+                    return failure("安全信息页面处理失败", "无法找到表单")
                 graph_oauth_log(log, "跳过 Microsoft 安全信息添加页面")
                 form_data = extract_hidden_inputs(form_match.group(2))
                 form_data["action"] = "Skip"
@@ -358,14 +369,13 @@ def extract_graph_refresh_token(
                     resp2 = session.get(loc, timeout=30, allow_redirects=False)
                 continue
 
-            return make_graph_oauth_response(
-                False,
+            return failure(
                 "授权流程卡住",
                 f"在 {current_url[:100]} 无法继续 (status={resp2.status_code})",
             )
 
         if not auth_code:
-            return make_graph_oauth_response(False, "未能获取授权码", "完成所有步骤但未捕获到授权码")
+            return failure("未能获取授权码", "完成所有步骤但未捕获到授权码")
 
         graph_oauth_log(log, "使用授权码换取 Outlook token")
         token_resp = session.post(
@@ -383,11 +393,11 @@ def extract_graph_refresh_token(
 
         if "access_token" not in token_data:
             err = token_data.get("error_description", token_data.get("error", "?"))
-            return make_graph_oauth_response(False, "Token 换取失败", err)
+            return failure("Token 换取失败", err)
 
         refresh_token = str(token_data.get("refresh_token") or "").strip()
         if not refresh_token:
-            return make_graph_oauth_response(False, "未获取到 refresh_token", "响应中包含 access_token 但没有 refresh_token")
+            return failure("未获取到 refresh_token", "响应中包含 access_token 但没有 refresh_token")
 
         graph_oauth_log(log, "已获取 Outlook refresh_token")
         return {
@@ -396,7 +406,7 @@ def extract_graph_refresh_token(
             "client_id": client_id,
         }
     except Exception as exc:
-        return make_graph_oauth_response(False, f"异常: {type(exc).__name__}", str(exc))
+        return failure(f"异常: {type(exc).__name__}", str(exc))
 
 
 def get_upload_account_for_graph_auth(account_id: int):
@@ -532,11 +542,17 @@ def save_graph_authorization_result(upload_row: Any, client_id: str,
 def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, Any] | object]",
                          mode: str = "graph", *,
                          save_authorization: Optional[Callable[..., Dict[str, Any]]] = None) -> None:
+    sensitive_values = []
+
     def emit(payload: Dict[str, Any]) -> None:
+        payload = dict(payload)
+        for field in ('message', 'details'):
+            if field in payload:
+                payload[field] = graph_oauth_safe_details(payload[field], secrets=sensitive_values)
         output_queue.put(payload)
 
     def log(message: str) -> None:
-        emit({"type": "log", "message": graph_oauth_safe_details(message)})
+        emit({"type": "log", "message": message})
 
     with app.app_context():
         try:
@@ -549,6 +565,7 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
 
             email = str(upload_row['email'] or '').strip()
             password = get_upload_account_plain_password(upload_row)
+            sensitive_values.append(password)
             if not email or not password:
                 emit({"type": "error", "success": False, "mode": mode, "message": "邮箱或密码为空"})
                 emit({"type": "complete", "success": False})
@@ -576,13 +593,14 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
                 log=log,
                 proxy_url=auth_proxy_url,
             )
+            sensitive_values.extend([result.get("refresh_token"), result.get("access_token")])
             if not result.get("success"):
                 emit({
                     "type": "error",
                     "success": False,
                     "mode": mode,
-                    "message": graph_oauth_safe_details(result.get("error") or "授权失败"),
-                    "details": graph_oauth_safe_details(result.get("details") or ""),
+                    "message": result.get("error") or "授权失败",
+                    "details": result.get("details") or "",
                 })
                 emit({"type": "complete", "success": False})
                 return
@@ -601,6 +619,7 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
             except (TypeError, ValueError):
                 ok, error_msg, rotated_refresh_token = refresh_result
                 actual_channel = mode
+            sensitive_values.append(rotated_refresh_token)
             actual_channel = normalize_outlook_authorization_type(actual_channel)
             if not ok:
                 emit({
@@ -608,7 +627,7 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
                     "success": False,
                     "mode": mode,
                     "message": f"{mode_label} refresh_token 验证失败",
-                    "details": graph_oauth_safe_details(error_msg),
+                    "details": error_msg,
                 })
                 emit({"type": "complete", "success": False})
                 return
@@ -642,7 +661,7 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
                 "success": False,
                 "mode": normalize_graph_oauth_mode(mode),
                 "message": "授权任务异常",
-                "details": graph_oauth_safe_details(str(exc)),
+                "details": str(exc),
             })
             emit({"type": "complete", "success": False})
         finally:

@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import threading
@@ -15,6 +16,7 @@ if 'DATABASE_PATH' not in os.environ:
 import web_outlook_app as web
 
 
+GRAPH_TOKEN_EXTRACTOR = web.extract_graph_refresh_token
 HEADERS = {'X-API-Key': 'legacy-api-key'}
 ACCOUNT = {
     'email': 'user@outlook.com', 'password': 'password-secret',
@@ -293,10 +295,10 @@ def test_registration_finishes_authorization_before_response(client, monkeypatch
 def test_authorization_failure_keeps_pending_registration(client, monkeypatch, phase):
     if phase == 'extract':
         monkeypatch.setattr(web, 'extract_graph_refresh_token', Mock(return_value={
-            'success': False, 'error': 'password-secret', 'details': 'initial-refresh-secret',
+            'success': False, 'error': 'password-secret', 'details': 'refresh_token=initial-refresh-secret',
         }))
     elif phase == 'validate':
-        monkeypatch.setattr(web, 'test_refresh_token', Mock(return_value=(False, 'refresh-secret', '', 'graph')))
+        monkeypatch.setattr(web, 'test_refresh_token', Mock(return_value=(False, 'initial-refresh-secret', '', 'graph')))
     else:
         mark_authorized = web.mark_upload_account_authorized
         def fail_during_save(account_id):
@@ -340,6 +342,104 @@ def test_worker_exception_returns_failure(client, monkeypatch):
     response = register(client)
     assert response.status_code == 502
     assert 'password-secret' not in response.get_data(as_text=True)
+    assert response.get_json()['rawErrorLog'] == '授权任务异常\n***'
+
+
+@pytest.mark.parametrize('javascript_literal', [
+    json.dumps('Your account or password is incorrect. If you don\'t remember your password, reset it.'),
+    r"'Your account or password is incorrect. If you don\'t remember your password, reset it.'",
+])
+def test_registration_returns_full_graph_login_error_log(client, monkeypatch, javascript_literal):
+    # Exercise the real extractor, task queue and route without contacting Microsoft.
+    monkeypatch.setattr(web, 'extract_graph_refresh_token', GRAPH_TOKEN_EXTRACTOR)
+    session = Mock()
+    session.headers = {}
+    session.get.return_value = web.make_light_response('https://login.live.com/', '<input name="PPFT" value="flow">')
+    session.post.return_value = web.make_light_response(
+        'https://login.live.com/ppsecure/post.srf', f'<script>var sErrTxt = {javascript_literal};</script>',
+    )
+    monkeypatch.setattr(web.requests, 'Session', Mock(return_value=session))
+    response = register(client)
+    assert response.status_code == 502
+    assert response.headers['Cache-Control'] == 'no-store'
+    payload = response.get_json()
+    assert payload['error'] == 'OAuth authorization failed'
+    assert payload['rawErrorLog'].splitlines() == [
+        '开始 GraphAPI OAuth 授权',
+        '授权模式: GraphAPI',
+        f'授权 Scope: {web.GRAPH_EXTRACT_GRAPH_SCOPE}',
+        f'获取 Microsoft 授权页面: {ACCOUNT["email"]}',
+        '提交 Microsoft 登录凭据',
+        'Microsoft 登录失败',
+        "JavaScript错误信息: Your account or password is incorrect. If you don't remember your password, reset it.",
+    ]
+    web.test_refresh_token.assert_not_called()
+
+
+def test_registration_preserves_long_multiline_diagnostics_and_request_scoped_log(client, monkeypatch):
+    detail = 'AADSTS50076: ' + '追加の本人確認が必要です。' * 60 + '\nTrace ID: trace-123\nCorrelation ID: correlation-456'
+    def fail_extraction(*args, log, **kwargs):
+        log('Microsoft request started')
+        return {'success': False, 'error': 'OAuth 错误', 'details': detail}
+    extract = Mock(side_effect=fail_extraction)
+    monkeypatch.setattr(web, 'extract_graph_refresh_token', extract)
+    payload = register(client).get_json()
+    assert payload['rawErrorLog'].endswith('Microsoft request started\nOAuth 错误\n' + detail)
+    extract.side_effect = lambda *args, **kwargs: {'success': False, 'error': 'Second registration failed', 'details': 'Second attempt only'}
+    retry = register(client, email='another@outlook.com').get_json()
+    assert retry['account']['id'] != payload['account']['id']
+    assert retry['rawErrorLog'].endswith('Second registration failed\nSecond attempt only')
+    assert 'trace-123' not in retry['rawErrorLog']
+
+
+@pytest.mark.parametrize('phase', ['validate', 'save'])
+def test_registration_returns_validation_and_save_diagnostics_with_masked_secrets(client, monkeypatch, phase):
+    if phase == 'validate':
+        monkeypatch.setattr(web, 'test_refresh_token', Mock(return_value=(
+            False, 'invalid_grant\nToken: initial-refresh-secret\nRotated: rotated-token-value', 'rotated-token-value', 'graph',
+        )))
+        expected = 'GraphAPI refresh_token 验证失败\ninvalid_grant\nToken: ***\nRotated: ***'
+    else:
+        monkeypatch.setattr(web, 'save_external_mail_authorization', Mock(side_effect=RuntimeError(
+            'Database write failed: password-secret refresh-secret initial-refresh-secret',
+        )))
+        expected = '授权任务异常\nDatabase write failed: *** *** ***'
+    response = register(client)
+    assert response.status_code == 502
+    assert response.get_json()['rawErrorLog'].endswith(expected)
+    assert 'secret' not in response.get_data(as_text=True)
+    assert 'rotated-token-value' not in response.get_data(as_text=True)
+
+
+def test_registration_masks_password_with_special_characters_in_error_log(client, monkeypatch):
+    password = 'pa$$ word&extra'
+    monkeypatch.setattr(web, 'extract_graph_refresh_token', Mock(return_value={
+        'success': False, 'error': 'Sign-in failed',
+        'details': 'password=' + password + '\nEncoded: pa%24%24%20word%26extra',
+    }))
+    response = register(client, password=password)
+    assert response.status_code == 502
+    assert response.get_json()['rawErrorLog'].endswith('Sign-in failed\npassword=***\nEncoded: ***')
+    assert 'extra' not in response.get_data(as_text=True)
+
+
+def test_registration_success_does_not_include_raw_error_log(client):
+    response = register(client)
+    assert response.status_code == 201
+    assert 'rawErrorLog' not in response.get_json()
+
+
+@pytest.mark.parametrize('emit_done', [False, True])
+def test_worker_exception_preserves_prior_logs_even_after_done(client, monkeypatch, emit_done):
+    def failing_task(account_id, events, **kwargs):
+        events.put({'type': 'log', 'message': 'Last completed stage'})
+        if emit_done:
+            events.put(web.GRAPH_OAUTH_DONE)
+        raise RuntimeError('Connection failed: password-secret')
+    monkeypatch.setattr(web, 'run_graph_oauth_task', failing_task)
+    response = register(client)
+    assert response.status_code == 502
+    assert response.get_json()['rawErrorLog'] == 'Last completed stage\n授权任务异常\nConnection failed: ***'
 
 
 def test_actual_validation_channel_is_returned(client, monkeypatch):
