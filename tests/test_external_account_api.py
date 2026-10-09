@@ -291,6 +291,9 @@ def test_registration_finishes_authorization_before_response(client, monkeypatch
 
 @pytest.mark.parametrize('phase', ['extract', 'validate', 'save'])
 def test_authorization_failure_keeps_pending_registration(client, monkeypatch, phase):
+    original_extract = web.extract_graph_refresh_token
+    original_validate = web.test_refresh_token
+    original_mark = web.mark_upload_account_authorized
     if phase == 'extract':
         monkeypatch.setattr(web, 'extract_graph_refresh_token', Mock(return_value={
             'success': False, 'error': 'password-secret', 'details': 'initial-refresh-secret',
@@ -315,10 +318,82 @@ def test_authorization_failure_keeps_pending_registration(client, monkeypatch, p
         assert row['is_authorized'] == 0
         assert web.get_upload_account_plain_password(row) == ACCOUNT['password']
         assert web.get_account_by_email(ACCOUNT['email']) is None
+    retry = register(client, email='USER@OUTLOOK.COM')
+    assert retry.status_code == 502
+    assert retry.get_json()['account']['id'] == payload['account']['id']
+    monkeypatch.setattr(web, 'extract_graph_refresh_token', original_extract)
+    monkeypatch.setattr(web, 'test_refresh_token', original_validate)
+    monkeypatch.setattr(web, 'mark_upload_account_authorized', original_mark)
+    with web.app.app_context():
+        db = web.get_db()
+        group_id = db.execute("INSERT INTO groups (name) VALUES ('Retry group')").lastrowid
+        db.commit()
+    success = register(client, password='corrected-password', group_id=group_id, remark='Retry', httpProxy=HTTP_PROXY)
+    assert success.status_code == 201
+    assert success.get_json()['account']['id'] == payload['account']['id']
+    assert web.extract_graph_refresh_token.call_args.args == (ACCOUNT['email'], 'corrected-password')
+    assert web.extract_graph_refresh_token.call_args.kwargs['proxy_url'] == HTTP_PROXY
+    with web.app.app_context():
+        db = web.get_db()
+        row = db.execute('SELECT * FROM outlook_upload_accounts').fetchone()
+        assert db.execute('SELECT COUNT(*) FROM outlook_upload_accounts').fetchone()[0] == 1
+        assert row['is_authorized'] == 1
+        assert row['group_id'] == group_id
+        assert row['remark'] == 'Retry'
+        assert row['password'] != 'corrected-password'
+        assert web.get_upload_account_plain_password(row) == 'corrected-password'
+        assert web.get_account_by_email(ACCOUNT['email'])['password'] == 'corrected-password'
+
+
+@pytest.mark.parametrize('retry', [False, True])
+def test_registration_in_progress_rejects_duplicate_without_changing_pending(client, monkeypatch, retry):
+    if retry:
+        with monkeypatch.context() as failure:
+            failure.setattr(web, 'extract_graph_refresh_token', Mock(return_value={'success': False}))
+            assert register(client).status_code == 502
+    oauth_waiting = threading.Event()
+    resume_oauth = threading.Event()
+    original_extract = web.extract_graph_refresh_token
+
+    def pause_oauth(*args, **kwargs):
+        oauth_waiting.set()
+        assert resume_oauth.wait(10), 'OAuth regression test did not resume'
+        return original_extract(*args, **kwargs)
+
+    monkeypatch.setattr(web, 'extract_graph_refresh_token', pause_oauth)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(register, web.app.test_client())
+        try:
+            assert oauth_waiting.wait(10), 'API did not reach the OAuth phase'
+            duplicate = register(client, email='USER@OUTLOOK.COM', password='replacement')
+            assert duplicate.status_code == 409
+            with web.app.app_context():
+                row = web.get_db().execute('SELECT * FROM outlook_upload_accounts').fetchone()
+                assert web.get_upload_account_plain_password(row) == ACCOUNT['password']
+        finally:
+            resume_oauth.set()
+        assert future.result(timeout=10).status_code == 201
+
+
+@pytest.mark.parametrize('source,authorized', [('auto_auth', 0), ('external_api', 1)])
+def test_other_pending_registrations_are_not_overwritten(client, source, authorized):
+    with web.app.app_context():
+        db = web.get_db()
+        web.add_upload_account(ACCOUNT['email'], 'original')
+        db.execute('UPDATE outlook_upload_accounts SET source = ?, is_authorized = ?', (source, authorized))
+        db.commit()
+        before = dict(db.execute('SELECT * FROM outlook_upload_accounts').fetchone())
     assert register(client).status_code == 409
+    with web.app.app_context():
+        assert dict(web.get_db().execute('SELECT * FROM outlook_upload_accounts').fetchone()) == before
 
 
-def test_oauth_runs_after_releasing_registration_write_lock(client, monkeypatch):
+@pytest.mark.parametrize('retry', [False, True])
+def test_oauth_runs_after_releasing_registration_write_lock(client, monkeypatch, retry):
+    if retry:
+        with monkeypatch.context() as failure:
+            failure.setattr(web, 'extract_graph_refresh_token', Mock(return_value={'success': False}))
+            assert register(client).status_code == 502
     def extract(*args, **kwargs):
         db = web.get_db()
         db.execute("INSERT INTO groups (name) VALUES ('OAuth writer')")
@@ -336,10 +411,13 @@ def test_missing_oauth_completion_is_not_success(client, monkeypatch):
 
 
 def test_worker_exception_returns_failure(client, monkeypatch):
+    original_task = web.run_graph_oauth_task
     monkeypatch.setattr(web, 'run_graph_oauth_task', Mock(side_effect=RuntimeError('password-secret')))
     response = register(client)
     assert response.status_code == 502
     assert 'password-secret' not in response.get_data(as_text=True)
+    monkeypatch.setattr(web, 'run_graph_oauth_task', original_task)
+    assert register(client).status_code == 201
 
 
 def test_actual_validation_channel_is_returned(client, monkeypatch):
@@ -482,7 +560,12 @@ def test_legacy_auth_and_management_protection_unchanged(client):
 
 @pytest.mark.parametrize('phase', ['extract', 'validate'])
 @pytest.mark.parametrize('collision', ['primary', 'alias'])
-def test_registration_conflict_during_oauth_preserves_web_import(client, monkeypatch, phase, collision):
+@pytest.mark.parametrize('retry', [False, True])
+def test_registration_conflict_during_oauth_preserves_web_import(client, monkeypatch, phase, collision, retry):
+    if retry:
+        with monkeypatch.context() as failure:
+            failure.setattr(web, 'extract_graph_refresh_token', Mock(return_value={'success': False}))
+            assert register(client).status_code == 502
     oauth_waiting = threading.Event()
     resume_oauth = threading.Event()
     original_phase = getattr(web, 'extract_graph_refresh_token' if phase == 'extract' else 'test_refresh_token')

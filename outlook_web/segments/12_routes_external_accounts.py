@@ -1,6 +1,7 @@
 """Additive account APIs using the existing external API Key authentication."""
 
 from outlook_web.external_http_proxy import normalize_external_http_proxy
+from outlook_web.external_mail_registration import claim_external_mail_registration
 
 
 @app.after_request
@@ -170,6 +171,13 @@ def api_external_register_account():
     except ValueError as exc:
         return jsonify({'success': False, 'error': str(exc)}), 400
 
+    with claim_external_mail_registration(email_addr) as acquired:
+        if not acquired:
+            return jsonify({'success': False, 'error': 'Email account already exists'}), 409
+        return complete_external_mail_registration(email_addr, password, group_id, data, http_proxy)
+
+
+def complete_external_mail_registration(email_addr, password, group_id, data, http_proxy):
     db = get_db()
     try:
         # Serialize duplicate checks because the existing UNIQUE email is case-sensitive.
@@ -177,18 +185,31 @@ def api_external_register_account():
         if not get_group_by_id(group_id):
             return jsonify({'success': False, 'error': 'Group not found'}), 400
         existing_upload = db.execute(
-            'SELECT id FROM outlook_upload_accounts WHERE LOWER(email) = ? LIMIT 1', (email_addr,),
+            'SELECT * FROM outlook_upload_accounts WHERE LOWER(email) = ? LIMIT 1', (email_addr,),
         ).fetchone()
-        if existing_upload or email_exists_as_primary(email_addr) or email_exists_as_alias(email_addr):
+        if email_exists_as_primary(email_addr) or email_exists_as_alias(email_addr):
             return jsonify({'success': False, 'error': 'Email account already exists'}), 409
-        outcome = add_upload_account(
-            email_addr, password,
-            group_id=group_id,
-            remark=sanitize_input(data.get('remark', '').strip(), max_length=500),
-            proxy_url=http_proxy,
-        )
-        if outcome['status'] != 'added':
-            return jsonify({'success': False, 'error': 'Unable to register email account'}), 409
+        remark = sanitize_input(data.get('remark', '').strip(), max_length=500)
+        if existing_upload:
+            if existing_upload['source'] != 'external_api' or existing_upload['is_authorized'] != 0:
+                return jsonify({'success': False, 'error': 'Email account already exists'}), 409
+            # Retry a pending external registration using this request's settings.
+            db.execute(
+                '''
+                UPDATE outlook_upload_accounts
+                SET password = ?, group_id = ?, remark = ?, proxy_url = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''',
+                (encrypt_data(password), group_id, remark, http_proxy, existing_upload['id']),
+            )
+            outcome = {'id': existing_upload['id']}
+        else:
+            outcome = add_upload_account(
+                email_addr, password, group_id=group_id, remark=remark, proxy_url=http_proxy,
+            )
+            if outcome['status'] != 'added':
+                return jsonify({'success': False, 'error': 'Unable to register email account'}), 409
         db.commit()
     finally:
         if db.in_transaction:
