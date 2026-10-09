@@ -1,5 +1,7 @@
 """Additive account APIs using the existing external API Key authentication."""
 
+from outlook_web.external_http_proxy import normalize_external_http_proxy
+
 
 @app.after_request
 def prevent_external_account_api_caching(response):
@@ -112,10 +114,17 @@ def api_external_latest_emails():
         top = 0
     if not 1 <= top <= 50:
         return jsonify({'success': False, 'error': 'top must be an integer from 1 to 50'}), 400
+    try:
+        http_proxy = normalize_external_http_proxy(request.args.get('httpProxy', ''))
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
 
     account = get_account_by_email(email_addr)
     if not account:
         return jsonify({'success': False, 'error': 'Email account not found'}), 404
+    if http_proxy:
+        # Override only this fetch, including inherited fallback proxies.
+        account = dict(account, proxy_url=http_proxy, fallback_proxy_url_1='', fallback_proxy_url_2='')
     try:
         # Always contact the mail server, regardless of local retention settings.
         result = fetch_account_emails(account, folder, 0, top)
@@ -141,7 +150,7 @@ def api_external_register_account():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({'success': False, 'error': 'A JSON object is required'}), 400
-    allowed_fields = {'email', 'password', 'group_id', 'remark'}
+    allowed_fields = {'email', 'password', 'group_id', 'remark', 'httpProxy'}
     if set(data) - allowed_fields:
         return jsonify({'success': False, 'error': 'Unsupported registration field'}), 400
     for field in ('email', 'password', 'remark'):
@@ -156,6 +165,10 @@ def api_external_register_account():
     group_id = data.get('group_id', DEFAULT_GROUP_ID)
     if type(group_id) is not int or group_id <= 0:
         return jsonify({'success': False, 'error': 'group_id must be a positive integer'}), 400
+    try:
+        http_proxy = normalize_external_http_proxy(data.get('httpProxy', ''))
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
 
     db = get_db()
     try:
@@ -172,6 +185,7 @@ def api_external_register_account():
             email_addr, password,
             group_id=group_id,
             remark=sanitize_input(data.get('remark', '').strip(), max_length=500),
+            proxy_url=http_proxy,
         )
         if outcome['status'] != 'added':
             return jsonify({'success': False, 'error': 'Unable to register email account'}), 409

@@ -21,6 +21,7 @@ X-API-Key: your-api-key
 | `email` | はい | OAuth認可済みの受信アカウントのメールアドレス。大文字小文字は区別しません。登録済みの別名も利用できます。 |
 | `top` | いいえ | 最新から取得する件数。初期値 `1`、範囲 `1`〜`50`。 |
 | `folder` | いいえ | `inbox`（初期値）または `junkemail`。 |
+| `httpProxy` | いいえ | このリクエストで利用するHTTPプロキシURL。例: `http://user:password@proxy.example.com:8080`。省略・空文字の場合は既存のアカウント／グループ設定を利用。 |
 
 リクエストごとにGraph/IMAP経由でメールサーバーへ問い合わせます。ローカル保存メールは参照せず、未読限定や前回取得後の差分という意味ではありません。既存のメール取得処理・代理設定・取得順序を利用します。取得したメールを既読にはしません。
 
@@ -30,6 +31,8 @@ curl --get 'http://localhost:5000/api/external/latest-emails' \
   --data-urlencode 'email=user@outlook.com' \
   --data-urlencode 'top=1'
 ```
+
+プロキシを指定する場合は、上のコマンドに `--data-urlencode 'httpProxy=http://user:password@proxy.example.com:8080'` を追加します。指定値は今回のGraph/IMAP通信だけに適用し、アカウントの保存済みプロキシ設定は変更しません。保存済みのフォールバックプロキシも今回の取得には使用しません。
 
 成功時は `200` で以下の形式を返します。`emails` の各要素は既存メールAPIと同じ形式で、件名・送信者・受信日時・本文プレビューなどを含みます。メールがない場合も成功し、`emails: []` となります。
 
@@ -60,6 +63,7 @@ OAuth処理中はHTTPリクエストが完了しません。外部サービス�
 | `password` | はい | アカウントのパスワード。既存処理で暗号化して保存。空欄・空白のみは不可。前後の空白はパスワードの一部としてそのまま保存。 |
 | `group_id` | いいえ | 既存グループの正の整数ID。初期値 `1`。 |
 | `remark` | いいえ | 備考。最大500文字。 |
+| `httpProxy` | いいえ | OAuth認可・Token検証に使うHTTPプロキシURL。登録待ち／正式アカウントの `proxy_url` に保存。省略・空文字の場合は既存のグループ設定を利用。 |
 
 ```sh
 curl 'http://localhost:5000/api/external/mail' \
@@ -67,6 +71,12 @@ curl 'http://localhost:5000/api/external/mail' \
   -H 'Content-Type: application/json' \
   -d '{"email":"user@outlook.com","password":"your-password"}'
 ```
+
+プロキシを指定する場合のJSONは `{"email":"user@outlook.com","password":"your-password","httpProxy":"http://user:password@proxy.example.com:8080"}` です。OAuthが失敗した場合も登録待ちレコードにプロキシを保持するため、Web画面からの再認可にも利用できます。
+
+両APIの `httpProxy` は `http://ホスト:ポート` または `http://ユーザー名:パスワード@ホスト:ポート` 形式の文字列です。ポートは `1`〜`65535` の範囲で明示してください。認証情報の特殊文字はURLエンコードしてください（例: パスワード中の `+` → `%2B`、`@` → `%40`）。最新メールAPIではURL全体をさらに `--data-urlencode` でクエリに渡します。非HTTPのURL、不正なポート、パス（末尾の `/` を除く）・クエリ・フラグメント付きURLは `400` を返します。プロキシURLや認証情報はこれらのAPIレスポンスに含めません。
+
+利用するHTTPプロキシは **CONNECTトンネルに対応**している必要があります。OAuth・Graph・Token取得には接続先の443番ポート、IMAP取得には993番ポートへのCONNECTを許可してください。`http://` はプロキシへの接続方式を表し、CONNECT内のMicrosoftとの通信はTLSで行います。画面の「HTTPS CONNECT / SOCKS5対応」はこの条件を指しており、CONNECT非対応のHTTP転送プロキシは利用できません。使用するプロキシの接続先制限や認証方式によっては通信が失敗します。
 
 認可・Token検証・正式保存まで成功した場合は `201` で以下を返します。`id` は登録待ちテーブルのID、`account_id` は正式アカウントのIDです。パスワードやトークンは返しません。
 

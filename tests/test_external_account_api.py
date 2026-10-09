@@ -130,6 +130,131 @@ def test_registration_preserves_password_whitespace(client):
         assert web.decrypt_data(row['password']) == password
 
 
+HTTP_PROXY = 'http://proxy-user:proxy%2Bsecret%40word@proxy.example:8080'
+
+
+def set_test_proxies(account_id=None):
+    with web.app.app_context():
+        db = web.get_db()
+        table = 'accounts' if account_id else 'groups'
+        db.execute(
+            f'UPDATE {table} SET proxy_url = ?, fallback_proxy_url_1 = ?, fallback_proxy_url_2 = ? WHERE id = ?',
+            ('http://stored.example:8080', 'http://fallback.example:8080', 'direct', account_id or 1),
+        )
+        db.commit()
+
+
+@pytest.mark.parametrize('proxy', [HTTP_PROXY, 'http://[::1]:8080'])
+def test_registration_http_proxy_used_for_oauth_and_saved(client, proxy):
+    set_test_proxies()
+    response = register(client, httpProxy=f' {proxy} ')
+    assert response.status_code == 201
+    assert web.extract_graph_refresh_token.call_args.kwargs['proxy_url'] == proxy
+    assert web.test_refresh_token.call_args.kwargs['proxy_url'] == proxy
+    with web.app.app_context():
+        upload = web.get_upload_account_for_graph_auth(response.get_json()['account']['id'])
+        account = web.get_account_by_id(response.get_json()['account']['account_id'])
+        assert upload['proxy_url'] == account['proxy_url'] == proxy
+    assert 'proxy-user' not in response.get_data(as_text=True)
+    assert 'proxy%2Bsecret' not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize('proxy_input', [{}, {'httpProxy': ''}, {'httpProxy': '  '}])
+def test_registration_omitted_or_empty_proxy_inherits_group(client, proxy_input):
+    set_test_proxies()
+    assert register(client, **proxy_input).status_code == 201
+    assert web.extract_graph_refresh_token.call_args.kwargs['proxy_url'] == 'http://stored.example:8080'
+    assert web.test_refresh_token.call_args.kwargs['proxy_url'] == 'http://stored.example:8080'
+
+
+def test_registration_failure_keeps_http_proxy_without_exposing_it(client, monkeypatch):
+    monkeypatch.setattr(web, 'extract_graph_refresh_token', Mock(return_value={
+        'success': False, 'error': HTTP_PROXY,
+    }))
+    response = register(client, httpProxy=HTTP_PROXY)
+    assert response.status_code == 502
+    with web.app.app_context():
+        row = web.get_upload_account_for_graph_auth(response.get_json()['account']['id'])
+        assert row['proxy_url'] == HTTP_PROXY
+        assert not row['is_authorized']
+    assert HTTP_PROXY not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize('inherit', [True, False])
+@pytest.mark.parametrize('channel', ['graph', 'imap', 'generic_imap'])
+def test_latest_http_proxy_overrides_fetch_without_saving(client, monkeypatch, inherit, channel):
+    account_id = authorize_registered_account(client)
+    set_test_proxies(None if inherit else account_id)
+    with web.app.app_context():
+        if channel != 'graph':
+            db = web.get_db()
+            if channel == 'imap':
+                db.execute("UPDATE accounts SET authorization_type = 'imap' WHERE id = ?", (account_id,))
+            else:
+                db.execute("UPDATE accounts SET account_type = 'imap', imap_host = 'imap.example' WHERE id = ?", (account_id,))
+            db.commit()
+        before = web.get_account_by_id(account_id)
+    functions = {'graph': 'get_emails_graph', 'imap': 'get_emails_imap_with_server', 'generic_imap': 'get_emails_imap_generic'}
+    fetch = Mock(return_value={'success': True, 'emails': []})
+    monkeypatch.setattr(web, functions[channel], fetch)
+    query = {'email': ACCOUNT['email'], 'httpProxy': HTTP_PROXY}
+    response = client.get('/api/external/latest-emails', headers=HEADERS, query_string=query)
+    assert response.status_code == 200
+    fetch.assert_called_once()
+    if channel == 'generic_imap':
+        assert fetch.call_args.args[-1] == HTTP_PROXY
+    else:
+        assert fetch.call_args.args[-2:] == (HTTP_PROXY, ['', ''])
+    with web.app.app_context():
+        after = web.get_account_by_id(account_id)
+        for field in ('proxy_url', 'fallback_proxy_url_1', 'fallback_proxy_url_2'):
+            assert after[field] == before[field]
+    assert HTTP_PROXY not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize('proxy_input', [{}, {'httpProxy': ''}, {'httpProxy': '  '}])
+def test_latest_omitted_or_empty_proxy_keeps_existing_fallbacks(client, monkeypatch, proxy_input):
+    authorize_registered_account(client)
+    set_test_proxies()
+    graph = Mock(return_value={'success': True, 'emails': []})
+    monkeypatch.setattr(web, 'get_emails_graph', graph)
+    query = {'email': ACCOUNT['email'], **proxy_input}
+    assert client.get('/api/external/latest-emails', headers=HEADERS, query_string=query).status_code == 200
+    assert graph.call_args.args[-2:] == ('http://stored.example:8080', ['http://fallback.example:8080', 'direct'])
+
+
+@pytest.mark.parametrize('proxy', [
+    'proxy.example:8080', 'socks5://proxy.example:1080', 'https://proxy.example:8080',
+    'http://proxy.example', 'http://:8080', 'http://proxy.example:abc',
+    'http://proxy.example:0', 'http://proxy.example:65536', 'http://[broken:8080',
+    'http://proxy.example:8080/path', 'http://proxy.example:8080?secret=hidden',
+    'http://proxy.example:8080#hidden', 'http://proxy\n.example:8080',
+])
+@pytest.mark.parametrize('endpoint', ['register', 'latest'])
+def test_invalid_http_proxy_rejected_before_write_or_fetch(client, monkeypatch, proxy, endpoint):
+    fetch = Mock()
+    monkeypatch.setattr(web, 'fetch_account_emails', fetch)
+    if endpoint == 'register':
+        response = register(client, httpProxy=proxy)
+    else:
+        response = client.get('/api/external/latest-emails', headers=HEADERS,
+                              query_string={'email': ACCOUNT['email'], 'httpProxy': proxy})
+    assert response.status_code == 400
+    assert proxy not in response.get_data(as_text=True)
+    fetch.assert_not_called()
+    web.extract_graph_refresh_token.assert_not_called()
+    with web.app.app_context():
+        assert web.get_db().execute('SELECT COUNT(*) FROM outlook_upload_accounts').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('proxy', [None, False, 123, {}, []])
+def test_registration_non_string_http_proxy_rejected(client, proxy):
+    response = register(client, httpProxy=proxy)
+    assert response.status_code == 400
+    assert response.get_json()['error'] == 'httpProxy must be a string'
+    web.extract_graph_refresh_token.assert_not_called()
+
+
 def test_old_post_route_removed(client):
     assert client.post('/api/external/accounts', headers=HEADERS, json=ACCOUNT).status_code == 405
 
