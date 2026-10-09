@@ -2,7 +2,7 @@
 
 social-media-managerのPulumiで作成したECRとLightsailを使い、OutlookEmailのmainをビルド → ECRへpush → Lightsailへデプロイします。ローカルのDBは移行せず、初回は新しいDBで開始します。
 
-PRのマージだけではAWSデプロイは始まりません。初回・通常更新・切り戻しは、同じGitHub Actionsをmainから手動実行します。
+mainへのpush（PRのマージを含む）で、GitHub Actionsが検証・ビルド・AWSデプロイまで自動実行します。変更ファイルによる実行対象の絞り込みはありません。初回の再実行や切り戻しには、同じGitHub Actionsをmainから手動実行できます。
 
 ## 初回に行うこと
 
@@ -65,9 +65,11 @@ awk '{print "52.199.82.242 " $1 " " $2}' /etc/ssh/ssh_host_ed25519_key.pub
 
 初期化済みVMには`/opt/outlookemail/host.env`、`app.env`、Caddyの待機ページがあります。SSHで調べる場合は、`sudo test -f /var/lib/outlookemail/bootstrap.ready`で初期化完了を確認できます。`app.env`の内容を公開ログへ貼り付けないでください。
 
-### 4. CIのPRをマージして手動実行する
+### 4. CIのPRをマージして自動デプロイを確認する
 
-OutlookEmailのCI用PRを確認・マージ後、**Actions → Deploy OutlookEmail to AWS → Run workflow**を選びます。
+先に上記の準備を完了してから、OutlookEmailのCI用PRを確認・mainへマージします。**Actions → Deploy OutlookEmail to AWS**で、mainへのpushにより開始した実行を確認します。自動実行は、そのpushのコミットSHAを使用します。
+
+手動で再実行する場合は、**Run workflow**を選びます。
 
 - **Branch: main**
 - **commit_sha: 空欄**（実行時点のmainを使用）
@@ -100,13 +102,13 @@ DB作成後のログインパスワードはアプリの設定画面から変更
 
 ## 通常の更新・切り戻し
 
-変更をmainへマージ後、同じworkflowをmainから実行します。通常は`commit_sha`を空欄にします。アプリは単一コンテナを置き換えるため、更新中に短い停止が発生します。
+変更をmainへマージすると、同じworkflowが自動実行されます。手動で通常更新を行う場合はmainから実行し、`commit_sha`を空欄にします。自動実行と手動実行は同じconcurrencyグループで直列化され、実行中のデプロイを新しいpushでキャンセルしません。アプリは単一コンテナを置き換えるため、更新中に短い停止が発生します。
 
 既存DBがある場合は、コンテナの置き換え前に`outlookemail-backup.service`でDB・関連ファイルをバックアップし、失敗したら更新を中止します。日次バックアップも既存のInfra設定を利用します。
 
 起動・Caddyの疎通確認に失敗した場合は、直前のイメージとCompose/Caddy設定へ戻します。初回失敗は待機ページへ戻します。成功したSHAとdigestはVMの`/opt/outlookemail/current-deployment.json`に記録します。
 
-明示的な切り戻しでは、`commit_sha`へ**mainに含まれる40桁の過去SHA**を指定します。タグを上書きせずdigestでデプロイします。イメージがECRから削除されていれば、そのSHAを再ビルドします。
+明示的な切り戻しでは、workflowをmainから手動実行し、`commit_sha`へ**mainに含まれる40桁の過去SHA**を指定します。タグを上書きせずdigestでデプロイします。イメージがECRから削除されていれば、そのSHAを再ビルドします。切り戻し後も、次のmainへのpushはそのコミットを自動デプロイします。
 
 DBは自動で過去へ戻しません。DB構造が古いコードと互換でない変更は、通常のイメージ切り戻しだけでは復旧できません。バックアップを確認して復旧方法を判断します。
 
@@ -114,4 +116,4 @@ workflowを強制停止した場合など、一時SSHルールが残ったらLig
 
 ## PR時の検証と実際のデプロイの違い
 
-PRのActionsはAWSへ接続せず、失敗復旧・秘密情報の受け渡し・SSHルール保持のテストを実行します。AWSへのpush・SSH・HTTPS公開の確認は、マージ後にユーザーが手動実行して初めて行われます。
+デプロイ関連ファイルを変更するPRのActionsはAWSへ接続せず、失敗復旧・秘密情報の受け渡し・SSHルール保持のテストを実行します。AWSへのpush・SSH・HTTPS公開の確認は、mainへのマージ後の自動実行（またはmainからの手動実行）で行われます。必要なSecretが未設定の場合は、ビルド・AWS接続に進む前の検証で失敗します。

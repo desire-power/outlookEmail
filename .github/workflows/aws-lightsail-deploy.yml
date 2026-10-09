@@ -1,6 +1,8 @@
 name: Deploy OutlookEmail to AWS
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
     paths:
@@ -42,8 +44,8 @@ jobs:
           python-version: "3.11"
       - name: Validate deployment scripts
         run: python3 -B -m unittest discover -s tests -p test_aws_deploy.py -v
-      - name: Validate secret configuration for manual deployment
-        if: github.event_name == 'workflow_dispatch'
+      - name: Validate secret configuration for deployment
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
           LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
           LIGHTSAIL_SSH_PRIVATE_KEY: ${{ secrets.LIGHTSAIL_SSH_PRIVATE_KEY }}
@@ -56,7 +58,7 @@ jobs:
           python3 scripts/aws/deploy_via_ssh.py --check-secrets
 
   build:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 20
